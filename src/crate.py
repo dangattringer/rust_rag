@@ -1,9 +1,8 @@
-import logging
 import re
 from pathlib import Path
 import tempfile
 import requests
-from typing import Self
+from typing import Optional, Self
 import zipfile
 from rich.progress import (
     Progress,
@@ -16,40 +15,35 @@ from rich.progress import (
 from rich.console import Console
 from rich.panel import Panel
 from rich.text import Text
+from rich.table import Table
 from bs4 import BeautifulSoup as bs
-from pydantic import BaseModel, Field
 
 from .client import Client
+from .logger import Logger
 
-logging.basicConfig(level=logging.INFO)
 
-
-class CrateBase(BaseModel):
+class CrateBase(Logger):
     """Base model for Rust crate metadata."""
 
-    name: str = Field(..., description="The name of the crate")
-    version: str | None = Field(None, description="The version of the crate")
-    latest_version: str | None = Field(
-        None, description="The latest version of the crate"
-    )
-
-    url_templates: dict[str, str] = Field(
-        {
+    def __init__(self, name: str, version: str | None = None):
+        super().__init__()
+        self.name = name
+        self.version = version
+        self.latest_version = None
+        self.url_templates = {
             "download": "https://docs.rs/crate/{name}/{version}/download",
             "download_latest": "https://docs.rs/crate/{name}/latest/download/",
             "latest": "https://docs.rs/crate/{name}/latest",
-        },
-        description="URL templates for fetching crate metadata and documentation",
-    )
+        }
 
 
 class Crate(CrateBase):
     """Rust crate documentation downloader."""
 
-    client: Client = Field(Client(), description="The client to use for the requests")
-    output_path: Path | None = Field(
-        None, description="The path to save the downloaded documentation"
-    )
+    def __init__(self, name: str, version: Optional[str] = None):
+        super().__init__(name=name, version=version)
+        self.client = Client()
+        self.output_path = None
 
     def fetch_metadata(self) -> None:
         """Fetch the latest version of the crate."""
@@ -65,8 +59,16 @@ class Crate(CrateBase):
             if crate_title:
                 version_match = re.search(r"\d+\.\d+\.\d+", crate_title.text)
                 self.latest_version = version_match.group() if version_match else None
-        except (requests.RequestException, AttributeError) as e:
-            logging.error(f"Failed to fetch metadata for {self.name}: {e}")
+        except requests.HTTPError as e:
+            self.logger.error(
+                f"Failed to fetch metadata for {self.name}: HTTPError {e.response.status_code} {e}"
+            )
+            raise
+        except requests.RequestException as e:
+            self.logger.error(f"Failed to fetch metadata for {self.name}: {e}")
+            raise
+        except Exception as e:
+            self.logger.error(f"Failed to fetch metadata for {self.name}: {e}")
             raise
 
     @classmethod
@@ -74,22 +76,15 @@ class Crate(CrateBase):
         """Create a Crate instance with the latest version."""
         crate = cls(name=name)
         crate.fetch_metadata()
-
-        return cls.model_validate(
-            {
-                "name": name,
-                "version": crate.latest_version,
-                "latest_version": crate.latest_version,
-            }
-        )
+        crate.version = crate.latest_version
+        return crate
 
     @classmethod
     def from_version(cls, name: str, version: str) -> Self:
         """Create a Crate instance with a specific version."""
-        latest_version = cls.from_latest_version(name).latest_version
-        return cls.model_validate(
-            {"name": name, "version": version, "latest_version": latest_version}
-        )
+        crate = cls(name=name, version=version)
+        crate.fetch_metadata()
+        return crate
 
     def download_docs(self, output_path: Path) -> None:
         """Download and extract crate documentation."""
@@ -100,8 +95,9 @@ class Crate(CrateBase):
             name=self.name, version=self.version
         )
         try:
-            logging.info(f"Downloading docs from: {download_url}")
+            self.logger.info(f"Downloading docs from: {download_url}")
             response = self.client.session.get(download_url, stream=True)
+            response.raise_for_status()
             total_size = int(response.headers.get("content-length", 0))
 
             if response.status_code == 404:
@@ -129,9 +125,22 @@ class Crate(CrateBase):
 
                 self._extract_zip(Path(tmp_file.name), output_path)
 
-            logging.info(f"Successfully extracted docs to: {output_path}")
+            self.logger.info(f"Successfully extracted docs to: {output_path}")
+        except requests.HTTPError as e:
+            if e.response.status_code == 404:
+                self.logger.error(
+                    f"Error downloading docs: Documentation not found for {download_url}"
+                )
+                raise ValueError(f"Documentation not found: {download_url}") from e
+            self.logger.error(
+                f"Error downloading docs: {e} - Response {e.response.status_code}"
+            )
+            raise
+        except zipfile.BadZipFile as e:
+            self.logger.error(f"Error extracting the zip file {e}")
+            raise
         except Exception as e:
-            logging.error(f"Error downloading docs: {e}")
+            self.logger.error(f"Error downloading docs: {e}")
             raise
         finally:
             self._cleanup_download(output_path)
@@ -165,15 +174,23 @@ class Crate(CrateBase):
         """Clean up temporary files and empty directories."""
         zip_path = Path(tempfile.gettempdir()) / f"{self.name}-{self.version}.zip"
         if zip_path.exists():
-            zip_path.unlink()
+            try:
+                zip_path.unlink()
+            except OSError as e:
+                self.logger.warning(f"Failed to delete temp file: {zip_path} - {e}")
 
         if not list(output_path.glob("*")):
-            output_path.rmdir()
-            logging.info(f"Removed empty output path: {output_path}")
+            try:
+                output_path.rmdir()
+                self.logger.info(f"Removed empty output path: {output_path}")
+            except OSError as e:
+                self.logger.warning(
+                    f"Failed to remove output path: {output_path} - {e}"
+                )
 
     def _process_html_files(self):
         """Process downloaded HTML files."""
-        src_path = self.output_path / self.name
+        src_path = self.output_path / self.name / "src"
         html_files = list(src_path.glob("**/*.html"))
         console = Console()
         console.print(
@@ -184,10 +201,28 @@ class Crate(CrateBase):
         self._process_html_files()
 
     def __str__(self):
-        return f"""{self.__class__.__name__}:
-    name: {self.name}
-    version: {self.version}
-    latest_version: {self.latest_version}"""
+        console = Console(force_terminal=True)
+
+        table = Table(
+            show_header=False, show_edge=False, border_style="blue", style="bold"
+        )
+        table.add_column("Attribute", style="cyan")
+        table.add_column("Value", style="magenta")
+        table.add_row("Crate", self.name)
+        table.add_row("Version", self.version)
+        table.add_row("Version (latest)", self.latest_version)
+        table.add_row("Output Path", str(self.output_path))
+        panel = Panel(
+            table,
+            expand=False,
+            border_style="blue",
+            title="Crate Info",
+            style="bold",
+            padding=(1, 1),
+        )
+        with console.capture() as capture:
+            console.print(panel)
+        return capture.get()
 
     def save(self, output_path: Path = Path("tmp")):
         """Serialize Crate instance to pickle."""
@@ -195,14 +230,21 @@ class Crate(CrateBase):
 
         output_path = Path(output_path)
         output_path.mkdir(exist_ok=True, parents=True)
-        with open(output_path / f"{self.name}.pickle", "wb") as file:
-            pickle.dump(self, file)
-        logging.info(f"Saved {self} to {output_path}")
+        try:
+            with open(output_path / f"{self.name}.pickle", "wb") as file:
+                pickle.dump(self, file)
+            self.logger.info(f"Saved {self.name} to {output_path}")
+        except pickle.PickleError as e:
+            self.logger.error(f"Failed to save Crate to {output_path} - {e}")
+            raise
 
     @classmethod
     def load(cls, file_path: Path):
         """Deserialize Crate instance from pickle."""
         import pickle
 
-        with open(file_path, "rb") as file:
-            return pickle.load(file)
+        try:
+            with open(file_path, "rb") as file:
+                return pickle.load(file)
+        except pickle.PickleError as e:
+            raise Exception(f"Error loading pickle file {file_path} - {e}")
